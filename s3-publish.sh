@@ -17,7 +17,7 @@ fi
 
 # Would be a good idea to wipe out the prod env first, so that DELETE_REMOVED works properly
 # If you're comfortable with that, uncomment the line below:
-# rm -rf output_prod/*
+rm -rf output_prod/*
 
 vendor/bin/sculpin generate --env=prod || ( echo "Could not generate the site" && exit )
 
