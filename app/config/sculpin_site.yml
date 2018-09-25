@@ -3,6 +3,7 @@
 # in a template to get the contents of the `title` key.
 title: Daniel Karp's Blog
 subtitle: Daniel writes about programming, mostly.
+google_analytics_tracking_id: UA-51058421-1
 
 # Insert your disqus shortname
 disqus:
