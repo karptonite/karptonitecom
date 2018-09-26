@@ -29,6 +29,20 @@
             </p>
         {% endif %}
 
+<p class="share">
+    <span>
+        Share this post on
+    </span>
+
+    <a class="icon-twitter" target="_blank" href="http://twitter.com/share?text={{ page.title|url_encode }}&amp;source={{ site.public_url|url_encode}}{{ page.url|url_encode }}">
+        <i class="fa fa-twitter-square fa-3x"></i>
+    </a>
+
+    <a class="icon-reddit" target="_blank" href="http://reddit.com/submit?title={{ page.title|url_encode }}&amp;url={{ site.public_url|url_encode}}{{ page.url|url_encode }}/">
+        <i class="fa fa-reddit-square fa-3x"></i>
+    </a>
+
+</p>
         {% if page.previous_post or page.next_post %}
             <nav class="article">
                 <ul>
@@ -42,7 +56,6 @@
             </nav>
         {% endif %}
     </article>
-
 
 {% if site.disqus.shortname and site.disqus.shortname != '' %}
 <div id="disqus_thread"></div>
