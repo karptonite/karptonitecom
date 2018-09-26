@@ -1,5 +1,5 @@
 ---
-title: "Using Edge Side Includes for better API HTTP Caching"
+title: "Using Edge Side Includes to improve HTTP Caching for your API"
 date: 2018-09-24T21:55:07-04:00
 categories:
     - varnish
@@ -12,7 +12,10 @@ conjunction with an ongoing redesign.  Currently, the only consumer of the API
 is our Angular front end; in order to improve performance of the front end, as
 well as to take pressure off of our application servers, we added
 [Varnish](https://varnish-cache.org/) caching to our API via
-[Fastly](https://www.fastly.com/).
+[Fastly](https://www.fastly.com/). there is a good summary of Varnish at the
+link provided, but in short, it is a cache that sits between our server and the
+API clients (for us, users' web browsers), and caches GET requests based the
+HTTP response headers provided by our servers.
 
 As with most caching solutions, the caching is the easy part; the hard part is
 cache invalidation, and making sure that we don't return stale data. I'd like
@@ -21,13 +24,104 @@ Includes](https://en.wikipedia.org/wiki/Edge_Side_Includes) (ESI) to ensure
 cache consistency at our endpoint while minimizing complexity for the API
 consumer.
 
-The Problem
+Motivation
+---
+To understand a frequent problem with HTTP caching, let's take a look at a
+simplified version of our comments API.  A GET request to the endpoint
+`/api/comments/[id]` returns a single comment by id. It might look something
+like this:
+~~~json
+{
+    "type": "comments",
+    "id": "8243204",
+    "body": "You should submit it to the photo contest",
+    "source": {
+        "type": "images",
+        "id": "4317736"
+    },
+    "postdate": "2018-09-24T06:17:32+00:00",
+    "author": 101597,
+    "thumbs": 154,
+    "links": [
+        {
+            "rel": "self",
+            "uri": "/api/comments/8243204"
+        }
+    ]
+}
+~~~
+
+Almost everything returned here is set at the time of creation, and is unlikely
+to change. We can cache this endpoint by setting the appropriate headers at the
+origin server, and purging the url (or invalidating with a surrogate key) if
+the user edits the comment. 
+
+However, there is a problem: one value, `thumbs`, can change at any time, and
+is controlled by a totally separate system. We could have the thumbs system
+purge the comment cache, but that would mean constantly purging a comment that
+receives many thumbs, just to change one number; moreover, I'd rather the
+thumbs system, which is responsibly for thumbs on all sorts of content, not
+have to be that smart. 
+
+Another solution would be to add to the links section a uri that retrieves the
+thumbs count, so that the client can look up this one value,[^1] but that is a
+lot of work for the client, especially if there are multiple dynamic endpoints
+of that sort.
+
+Edge Side Include
+---
+
+Our solution is to use an Edge Side Include for the thumbs. It works like this:
+The comment returned from our server to Varnish acually looks like this:
+
+~~~json
+{
+    "type": "comments",
+    "id": "8243204",
+    "body": "You should submit it to the photo contest",
+    "source": {
+        "type": "images",
+        "id": "4317736"
+    },
+    "postdate": "2018-09-24T06:17:32+00:00",
+    "author": 101597,
+    "thumbs": <esi:include src="/api/thumbs?type=comments&id=8243204"/>,
+    "links": [
+        {
+            "rel": "self",
+            "uri": "/api/comments/8243204"
+        }
+    ]
+}
+~~~
+
+Notice the value for `thumbs`; if you are not familiar with Edge Side
+Includes, this may look weird. It is not valid JSON, for one thing. But this is
+not a problem, because, properly configured (Varnish configuration is beyond
+the scope of this post, but it isn't too hard), Varnish understands ESI tags,
+and resolves them. It does so by looking up the url in its cache, and if it is
+present, inserting the content, and otherwise requesting the url from our
+servers, just as if any other request had come in. In this case,
+`/api/thumbs?type=comments&id=8243204` will return `154` (which is,
+incidentally, valid JSON, as are values like `true`, `false`, and `null`),
+and Varnish will insert it into the result and return it to the user.
+
+Varnish stores in cache for each endpoint what is returned from our server.
+That means that when a user requests a comment, it pulls the main response from
+comment from cache (or from our server), then separately pulls the thumbs count
+from cache (or from our server) and combines them. On the back end, the
+comments system can worry about purging the comments cache when necessary, and
+the thumbs system can worry about the purging the thumbs cache. The API
+consumer doesn't have to worry about any of this, and always gets consistent
+data.
+
+
+More Motivation: Collections
 ------
 
-To understand the problem, let's take a look at a simplified version of our
-comments API.  A GET request to the endpoint `/api/images/4317736/comments`
-returns the first page of comments posted on image 4317736. It might look something
-like this:
+Now let's look at a second, related problem: a GET request to the endpoint
+`/api/images/4317736/comments` returns the first page of comments posted on
+image 4317736. It might look something like this:
 ~~~json
 {
     "comments": [
@@ -41,20 +135,15 @@ like this:
             },
             "postdate": "2018-09-24T06:17:32+00:00",
             "author": 101597,
-            "href": "/image/4317736?commentid=8243204#comment8243204",
-            "collapsed": false,
+            "thumbs": 154,
             "links": [
                 {
                     "rel": "self",
                     "uri": "/api/comments/8243204"
                 },
-                {
-                    "rel": "author",
-                    "uri": "/api/users/101597"
-                }
             ]
         },
-        // More comments
+        // 50 More comments
         {},
         {},
         ....
@@ -62,35 +151,29 @@ like this:
     "links": []
 }
 ~~~
-We'd like to cache this endpoint in Varnish, but we have some problems. Each
-comment can be edited by a user. Moreover, the API has some flexibility in
+We'd like to cache this collection in Varnish, but each comment in the
+collection can be edited by a user. Moreover, the API has some flexibility in
 ordering and pagination--for example, you can ask for comments after (or
 before) a particular comment (by id). That means that a user editing their
-comment could mean we would have to purge many API endpoints.[^1] In addition,
-that `collapsed` value, which tells the front end whether to show the comment
-as collapsed, comes from an entirely unrelated moderation system. if we cached
-this endpoint, and the `collapsed` value changed, either the API data would be
-stale, or the moderation system server side would have to know how to purge the
-caches for these comments. None of this is ideal.
+comment could mean we would have to purge many API endpoints.[^2] In addition,
+one new comment being added would also require all such endpoints to be be
+purged.
 
 Solve by loading separate endpoints?
----
-One solution for this problem would be, instead of providing all of those
-values in the API response, to return a set of API links in the `links`
-section, one link for each comment, with each comment in turn proving a link to
-the moderation system; we could load all of these links over HTTP/2, and it
-would be fast. In fact, in many cases, we do exactly that. But it can create
+--- 
+
+One solution for this problem once again would be, instead of providing all of
+those complete comment objects in the API response, to return a set of API
+links, one for each comment; we could load all of these links over HTTP/2, and
+it would be fast. In fact, in many cases, we do exactly that. But it can create
 work for the consumer, and multiplies our HTTP requests (which we pay for by
 request).
 
-Edge Side Includes
+Edge Side Includes (redux)
 ---
-We've found that, in many cases, a better solution is to return the data as
-described above from the API, and to rely on ESIs to resolve the caching
-problem. 
+Once again, this is a case where we use Edge Side Includes.
 
-In brief, here is how this works: Instead of returning the full set of data as
-shown above, when Varnish requests the above enpoint, our server might return
+When Varnish requests the above enpoint, our server returns
 something like this:
 
 ~~~json
@@ -102,64 +185,20 @@ something like this:
     ],
     "links":[],
 }
-~~~
-If you are not familiar with Edge Side Includes, this may look weird. It is not
-valid JSON, for one thing. But this is not a problem, because, properly
-configured (Varnish configuration is beyond the scope of this post, but it
-isn't too hard), Varnish understands these ESI tags, and resolves them. It does
-so by looking up the url in its cache, and if it is present, inserting the
-content, and otherwise requesting the url from our servers, just like if any
-other request had come in.
-
-So what does it get when it looks up `/api/comments/8243204`? Our server
-returns something like this:
-~~~json
-{
-    "type": "comments",
-    "id": "8243204",
-    "body": "You should submit it to the photo contest",
-    "source": {
-        "type": "images",
-        "id": "4317736"
-    },
-    "postdate": "2018-09-24T06:17:32+00:00",
-    "author": 101597,
-    "href": "/image/4317736?commentid=8243204#comment8243204",
-    "collapsed": <esi:include src="/api/comments/8243204/collapsed"/>
-    "links": [
-        {
-            "rel": "self",
-            "uri": "/api/comments/8243204"
-        },
-        {
-            "rel": "author",
-            "ur": "/api/users/101597"
-        }
-    ]
-}
-~~~
-
-Notice that there is another ESI there, for `collapsed`. Varnish then looks up
-that value, and any other ESIs. In this case, the endpoint
-`/api/comments/8243204/collapsed` returns either `false` or `true`. (Note that
-those are valid JSON values).
-
-Varnish builds up the results by replacing the `<esi />` tag with whatever is
-returned by the uri specified by the `src`. Once Varnish builds up the the
-whole result from the ESIs, what is returned to the consumer is the valid JSON
-result I showed at the beginning.
-
-Varnish stores in cache for each endpoint what is returned from our server,
-with the ESI tags unresolved; This means that for each request, Varnish again
-builds up the ESIs from cache. This isn't necessarily instantaneous, especially
-if some of the caches have been purged, but it is pretty fast.[^2] This may
-seem a bit complicated, but look at what we gain:
+~~~ 
+Again, this is not valid JSON until Varnish resolves the ESIs. It looks up each
+comment, resolves the additional Edge Side includes in each comment (as above),
+and finally returns the full list of comments. Again, for each request, Varnish
+again builds up the ESIs from cache, sometimes over multiple levels. This isn't
+necessarily instantaneous, especially if some of the caches have are stale, but
+it is pretty fast.[^3] This may seem a bit complicated, but look at what we
+gain:
 
 First, we get almost automatic cache consistency. When a single comment is
 updated, we only have to purge the endpoint for that single comment. When the
-moderation system causes the value of `collapsed` to change, it purges the
-endpoint for its value. All of the other comments and other values can stay in
-cache undisturbed. When a new comment comes in, all we have to purge is the
+thumbs system causes the value of `thumbs` to change for one comment, it purges
+the endpoint for its value. All of the other comments and other values can stay
+in cache undisturbed. When a new comment comes in, all we have to purge is the
 endpoint for the list of comments (in the form of ESIs).
 
 Second, since all of these ESIs are resolved in Varnish, to the extend that the
@@ -168,14 +207,15 @@ request, for billing purposes.
 
 Caveats
 ---
-There are trade offs with this solution. It requires your API
-endpoints for single items to return fairly simple results-- our comments API,
-for a single comment, returns that comment in the root of the JSON response,
-and not much else. If we uses some more complex API specification like [JSON
-API](http://jsonapi.org/), this wouldn't work nearly so cleanly.
+There are trade offs with this solution. It requires your API endpoints for
+single items to return fairly simple results-- our comments API, for a single
+comment, returns that comment in the root of the JSON response, and not much
+else. If we uses some more complex API specification like [JSON
+API](http://jsonapi.org/), this wouldn't work nearly so cleanly, especially for
+collections.
 
-Generating those API responses with the ESIs embedded requires jumping through
-some hoops--because what we are generating is not valid JSON, standard
+Generating those API responses with the ESI tags embedded requires jumping
+through some hoops--because what we are generating is not valid JSON, standard
 libraries don't work. Our solution involves using placeholder strings, followed
 by JSON encoding, followed by some string replacements. 
 
@@ -184,33 +224,55 @@ else to resolve the ESIs) as part of the stack. That means more complexity for
 testing, either automated or manual. Varnish has to be a part of each
 developers stack for testing in the browser.
 
-There can be issues when an item is deleted; ideally, you'd purge all
-caches that might have ESIs for the deleted item, but that is not always
-practical. The solution we've come up with to deal with this issue is to have
-our 404 API responses return the text `null` (which is also valid JSON) so that
-any endpoint that includes an ESI to an invalid item will still return valid
-JSON.
+There is a performance penalty for adding ESIs (vs looking up a single cached
+value)--although it is very fast, we wouldn't want to add ESIs for values that
+aren't actually needed most of the time when an API endpoint is loaded.
+
+There can be issues when an item is deleted; ideally, you'd purge all caches
+that might have ESIs for the deleted item, but that is not always practical.
+The solution we've come up with to deal with this issue is to have our 404 API
+responses return the text `null` (which is also valid JSON) so that any
+endpoint that includes an ESI to an invalid item will still return valid JSON.
+Then our consumers have to understand how to deal with null values in a
+collection.
 
 Evaluation
 ---
 Despite these issues, we've found using ESIs in our API to be well worth the
 trouble; The biggest benefits are the cache consistency with relatively simple
-purging code, and the simplicity of use for the consumer.
+purging code, and the relative simplicity of use for the consumer.
+
+I recommend ESIs for three (related) cases:
+
+* When the API endpoint returns a collection, use an ESI for each item in the
+  collection, so each item can be invalidated separately.
+* When a value that is controlled by a separate system is added to an API
+  endpoint (such as thumbs), use an ESI to include that value, so that each
+  system can control its own cache invalidation.
+* When an API endpoint has a mix of stable and dynamic data (even if it all
+  orginates from the same system), include the dynamic data by ESI (or vice
+  versa). This allows the dynamic data to stay current, while preventing
+  requests for the more stable data from hitting the servers.
 
 I encourage other API authors to give this approach a try. I know this post is
 vague related to the details--I'd be happy to answer questions I can about
 implementation.
 
-[^1]: We do most of our cache purging manually, and don't expire them based on
-time, unless absolutely necessary. Because we purge with [Surrogate
-keys](https://docs.fastly.com/guides/purging/getting-started-with-surrogate-keys),
-this isn't quite as hard as it might seem, but it would still be much more
-difficult without ESIs.
+[^1]: OK, I lied. We actually _do_ use a link in the links section to get the
+  number of thumbs. But this was an easier to understand example than what we
+  actually use ESIs for in the comments system.
 
-[^2]: It could be even faster. We use Fastly to provide our Varnish caching
-services. Unfortunately, the version of Varnish that Fastly uses resolves Edge
-Side Includes in series. This can be a problem, especially if there are several
-stale caches. But the newest version of [Varnish
-Plus](https://www.varnish-software.com/products/varnish-plus/) resolves Edge
-Side Includes in parallel! On my wish list of things I'd like to do is to try
-out Varnish Plus.
+[^2]: We do most of our cache purging manually, and don't expire them based on
+  time, unless absolutely necessary. Because we purge with [Surrogate
+  keys](https://docs.fastly.com/guides/purging/getting-started-with-surrogate-keys),
+  this isn't quite as hard as it might seem, but it would still be much more
+  difficult without ESIs.
+
+[^3]: It could be even faster. We use Fastly to provide our Varnish caching
+  services. Unfortunately, the version of Varnish that Fastly uses resolves
+  Edge Side Includes in series. This can be a problem, especially if there are
+  several stale caches. But the newest version of [Varnish
+  Plus](https://www.varnish-software.com/products/varnish-plus/) resolves Edge
+  Side Includes in parallel! On my wish list of things I'd like to do is to try
+  out Varnish Plus. (Are you listening, Fastly? Parallel ESI resolution is a
+  killer feature!)
