@@ -1,6 +1,6 @@
 ---
 title: "Using Edge Side Includes to improve HTTP Caching for your API"
-date: 2018-09-24T21:55:07-04:00
+date: 2018-09-26T10:14:07-04:00
 categories:
     - varnish
     - caching
@@ -25,7 +25,7 @@ consumer.
 
 Motivation
 ---
-To understand a frequent problem with HTTP caching, let's take a look at a
+Let's take a look at a
 simplified version of our comments API.  A GET request to the endpoint
 `/api/comments/[id]` returns a single comment by id. It might look something
 like this:
@@ -62,16 +62,72 @@ receives many thumbs, just to change one number; moreover, I'd rather the
 thumbs system, which is responsibly for thumbs on all sorts of content, not
 have to be that smart. 
 
-Another solution would be to add to the links section a uri that retrieves the
-thumbs count, so that the client can look up this one value,[^1] but that is a
-lot of work for the client, especially if there are multiple dynamic endpoints
-of that sort.
+More Motivation: Collections
+------
+
+Now let's look at a second, related problem: a GET request to the endpoint
+`/api/images/4317736/comments` returns the first page of comments posted on
+image 4317736. It might look something like this:
+~~~json
+{
+    "comments": [
+        {
+            "type": "comments",
+            "id": "8243204",
+            "body": "You should submit it to the photo contest",
+            "source": {
+                "type": "images",
+                "id": "4317736"
+            },
+            "postdate": "2018-09-24T06:17:32+00:00",
+            "author": 101597,
+            "thumbs": 154,
+            "links": [
+                {
+                    "rel": "self",
+                    "uri": "/api/comments/8243204"
+                },
+            ]
+        },
+        // 50 More comments
+        {},
+        {},
+        ....
+    ],
+    "links": []
+}
+~~~
+
+We'd like to cache this collection in Varnish, but each comment in the
+collection can be edited by a user. Moreover, the API has some flexibility in
+ordering and pagination--for example, you can ask for comments after (or
+before) a particular comment (by id). A user adding or editing one comment
+would require us to purge many API endpoints, each of which would require quite a
+bit of data from our servers.[^1] 
+
+Solve by loading separate endpoints
+---
+
+In both of these cases, we have mixed content in one endpoint that becomes
+stale at diffent times.  An obvious solution is to say that if the content
+needs to be purged at diffent times, it should be loaded by different
+endpoints. This is a perfectly good solution; for the single comment endpoint,
+we could add a link to the thumbs count in the links section, so that the
+client can look up this one value. Similarly, the collection of comments,
+rather than returning the full comments, could return links to the API endpoint
+for each comment. We could load all of these links over HTTP/2, and it would be
+fast. In fact, in many cases, we do exactly that. But it can create a lot
+work for the consumer, and multiplies our HTTP requests (which we pay for by
+request).
+
+
 
 Edge Side Include
 ---
 
-Our solution is to use an Edge Side Include for the thumbs. It works like this:
-The comment returned from our server to Varnish acually looks like this:
+Our solution is to use an Edge Side Includes in both of these cases.[^2] It
+works like this: The comment returned from our server to Varnish acually looks
+like this:
 
 ~~~json
 {
@@ -114,66 +170,7 @@ the thumbs system can worry about the purging the thumbs cache. The API
 consumer doesn't have to worry about any of this, and always gets consistent
 data.
 
-
-More Motivation: Collections
-------
-
-Now let's look at a second, related problem: a GET request to the endpoint
-`/api/images/4317736/comments` returns the first page of comments posted on
-image 4317736. It might look something like this:
-~~~json
-{
-    "comments": [
-        {
-            "type": "comments",
-            "id": "8243204",
-            "body": "You should submit it to the photo contest",
-            "source": {
-                "type": "images",
-                "id": "4317736"
-            },
-            "postdate": "2018-09-24T06:17:32+00:00",
-            "author": 101597,
-            "thumbs": 154,
-            "links": [
-                {
-                    "rel": "self",
-                    "uri": "/api/comments/8243204"
-                },
-            ]
-        },
-        // 50 More comments
-        {},
-        {},
-        ....
-    ],
-    "links": []
-}
-~~~
-We'd like to cache this collection in Varnish, but each comment in the
-collection can be edited by a user. Moreover, the API has some flexibility in
-ordering and pagination--for example, you can ask for comments after (or
-before) a particular comment (by id). That means that a user editing their
-comment could mean we would have to purge many API endpoints.[^2] In addition,
-one new comment being added would also require all such endpoints to be be
-purged.
-
-Solve by loading separate endpoints?
---- 
-
-One solution for this problem once again would be, instead of providing all of
-those complete comment objects in the API response, to return a set of API
-links, one for each comment; we could load all of these links over HTTP/2, and
-it would be fast. In fact, in many cases, we do exactly that. But it can create
-work for the consumer, and multiplies our HTTP requests (which we pay for by
-request).
-
-Edge Side Includes (redux)
----
-Once again, this is a case where we use Edge Side Includes.
-
-When Varnish requests the above enpoint, our server returns
-something like this:
+Here is how the data is returned from our server for the collection of comments:
 
 ~~~json
 {
@@ -187,18 +184,24 @@ something like this:
 ~~~ 
 Again, this is not valid JSON until Varnish resolves the ESIs. It looks up each
 comment, resolves the additional Edge Side includes in each comment (as above),
-and finally returns the full list of comments. Again, for each request, Varnish
+and finally returns the full list of comments. For each request, Varnish
 again builds up the ESIs from cache, sometimes over multiple levels. This isn't
 necessarily instantaneous, especially if some of the caches have are stale, but
-it is pretty fast.[^3] This may seem a bit complicated, but look at what we
-gain:
+it is pretty fast.[^3] 
+
+
+Benefits
+---
+
+This may all seem a bit complicated, but look at what we gain:
 
 First, we get almost automatic cache consistency. When a single comment is
 updated, we only have to purge the endpoint for that single comment. When the
 thumbs system causes the value of `thumbs` to change for one comment, it purges
 the endpoint for its value. All of the other comments and other values can stay
 in cache undisturbed. When a new comment comes in, all we have to purge is the
-endpoint for the list of comments (in the form of ESIs).
+endpoint for the list of comments (in the form of ESIs)--this is much better
+purging endpoints that return the entire content of each comment.
 
 Second, since all of these ESIs are resolved in Varnish, to the extend that the
 endpoints are all in cache, one endpoint with many ESIs counts as a single
@@ -238,7 +241,7 @@ collection.
 Evaluation
 ---
 Despite these issues, we've found using ESIs in our API to be well worth the
-trouble; The biggest benefits are the cache consistency with relatively simple
+trouble. Some of the biggest benefits are the cache consistency with simple
 purging code, and the relative simplicity of use for the consumer.
 
 I recommend ESIs for three (related) cases:
@@ -257,15 +260,16 @@ I encourage other API authors to give this approach a try. I know this post is
 vague related to the details--I'd be happy to answer questions I can about
 implementation.
 
-[^1]: OK, I lied. We actually _do_ use a link in the links section to get the
-  number of thumbs. But this was an easier to understand example than what we
-  actually use ESIs for in the comments system.
 
-[^2]: We do most of our cache purging manually, and don't expire them based on
+[^1]: We do most of our cache purging manually, and don't expire them based on
   time, unless absolutely necessary. Because we purge with [Surrogate
   keys](https://docs.fastly.com/guides/purging/getting-started-with-surrogate-keys),
   this isn't quite as hard as it might seem, but it would still be much more
   difficult without ESIs.
+
+[^2]: OK, I'm about to lie. We actually _do_ use a link in the links section to
+  get the number of thumbs. But this was an easier to understand example than
+  what we actually use ESIs for in the comments system.
 
 [^3]: It could be even faster. We use Fastly to provide our Varnish caching
   services. Unfortunately, the version of Varnish that Fastly uses resolves
